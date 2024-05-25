@@ -1,0 +1,927 @@
+# -*- coding: utf-8 -*-
+#    gp for solving multi-vehicle uncapacitated ARP designed by yuxin
+#    与静态相比，读的数据要改变，评价方式换成不确定环境及平均值，
+#    多辆车并行，用一个list存储时刻表
+#    车辆选择下一个任务的方式是：车-任务选前n个，然后任务-车确定一个。
+#    Step1: compared with the baseline GPHH
+
+import operator
+import math
+import random
+
+import numpy
+import copy
+import datetime
+from deap import algorithms
+from deap import base
+from deap import creator
+from deap import tools
+from deap import gp
+#from sympy import *
+from deap.gp import Terminal, Primitive
+from openpyxl import Workbook
+from openpyxl import load_workbook
+import os
+from util.excelUtil import ExcelUtil
+
+import sys
+import readfile2
+import Path
+
+runID = 0
+
+class Vehicle:
+    vehicleTour=[]
+    def __init__(self, time, vehicleID, vehicleLoad, vehiclePosition,vehicleTour):
+        self.time = time
+        self.vehicleID = vehicleID
+        self.vehicleLoad = vehicleLoad
+        self.vehiclePosition = vehiclePosition
+        self.vehicleTour=vehicleTour
+
+# Define new functions
+def protectedDiv(left, right):
+    try:
+        return left / right
+    except ZeroDivisionError:
+        return 1
+
+def max(left, right):
+    if left >= right:
+        return left
+    else:
+        return right
+
+def min(left, right):
+    if left <=right:
+        return left
+    else:
+        return right
+
+pset = gp.PrimitiveSet("MAIN", 10)
+pset.addPrimitive(operator.add, 2)
+pset.addPrimitive(operator.sub, 2)
+pset.addPrimitive(operator.mul, 2)
+pset.addPrimitive(protectedDiv, 2)
+pset.addPrimitive(max, 2)
+pset.addPrimitive(min, 2)
+#pset.addPrimitive(math.sin, 1)
+#pset.addPrimitive(math.atan2, 2)
+pset.addEphemeralConstant("rand101", lambda: round(random.uniform(0, 1), 2))
+# change the name of arguments from ARG0 to x
+pset.renameArguments(ARG0='CFH') #Cost From Here (the current node) to the head node of the candidate task---1. 需要归一化吗？不需要
+#pset.renameArguments(ARG1="CFR1") #Cost From the closest feasible alternative Route to the candidate task???---2。不理解
+pset.renameArguments(ARG1="CR") #Cost to Refill (from the current node to the depot)
+pset.renameArguments(ARG2="CTD") #Cost from the tail node of the candidate task To the Depot??---3。是一个candidate序列吗？
+pset.renameArguments(ARG3="CTT1") #Cost from the tail of the candidate task To its cloest unserved Task (the head)
+pset.renameArguments(ARG4="DEM") #DEMand of the candidate task---4.怎么感觉是所有candidata task的累加和
+pset.renameArguments(ARG5="DEM1") #DEMand of the closet unserved task to the candidata task
+pset.renameArguments(ARG6="FRT") #Fraction of the Remaining (unserved) Tasks
+#pset.renameArguments(ARG8="FUT") #Fraction of the Unassigned Tasks---5。在我这里和FRT一样啊
+pset.renameArguments(ARG7="FULL") #FULLness of the vehicle (current load over capacity)
+pset.renameArguments(ARG8="RQ") #Remaining Capacity of the vehicle
+#pset.renameArguments(ARG11="RQ1") #Remaining Capacity for the closet alternative route
+pset.renameArguments(ARG9="SC") #Serving Cost of the candidata task
+#pset.renameArguments(ARG10="CFR1") #Cost From the closest feasible alternative Route to the candidate task
+
+# creating fitness function and individual
+# 适应度表现为base模块中的Fitness基类，个体类表现为一个gp.PrimitiveTree
+creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
+creator.create("Individual", gp.PrimitiveTree, fitness=creator.FitnessMin)
+
+#register some parameters，使用register将自定函数填充到工具箱base.Toolbox()当中，后可通过toolbox.name调用。
+#过程中所需参数动态绑定
+toolbox = base.Toolbox()
+toolbox.register("expr", gp.genHalfAndHalf, pset=pset, min_=1, max_=2) #这里的1和2要check一下！！！！！！！！！
+toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.expr)
+# list和toolbox.individual为tool.initRepeat的参数，剩余一个参数在下面使用的时候传入，即n=300。
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+toolbox.register("compile", gp.compile, pset=pset)
+
+def showPath(s, e, instRoute, path):
+    if s == e:
+        instRoute.append(e)
+    else:
+        if path[s][e] != s:
+            showPath(s, path[s][e], instRoute, path)
+        if path[path[s][e]][e] != path[s][e]:
+            showPath(path[s][e], e, instRoute, path)
+        else:
+            instRoute.append(path[s][e])
+
+def floyd(verticeNum, arcList):
+    #除计算两点之间的最短路径dis外，还应记录最短路径的路线，记录在instRoute中
+    dis=[None] * verticeNum
+    path = [None] * verticeNum
+    pathList = []
+    for i in range(verticeNum):
+        dis[i]=[None] * verticeNum
+        path[i] = [None] * verticeNum
+        for j in range(verticeNum):
+            path[i][j] = i
+            if i == j:
+                dis[i][j] = 0.0
+            else:
+                dis[i][j] = 99999.0
+    for i in range(len(arcList)):
+        head = arcList[i].getHead()
+        tail = arcList[i].getTail()
+        if arcList[i].getConnect() == 1:
+            dis[head][tail] = arcList[i].getDeadCost() #用估计的值来计算，并且除去实际不存在，其余情况不再重新计算最短路径
+    # floyd algorithm
+    for k in range(verticeNum):
+        for i in range(verticeNum):
+            for j in range(verticeNum):
+                if dis[i][j] > dis[i][k] + dis[k][j]:
+                    dis[i][j] = dis[i][k] + dis[k][j]
+                    path[i][j] = k
+    # recall the route
+    for start in range(verticeNum):
+        for end in range(verticeNum):
+            instPath = Path.Path()
+            instRoute = []
+            instPath.setHead(start)
+            instPath.setTail(end)
+            showPath(start, end, instRoute, path)
+            instRoute.append(end)
+            instPath.setRoute(instRoute)
+            #print instRoute
+            pathList.append(instPath)
+    return dis, pathList
+
+
+def travel(start, end, dis, pathList, verticeNum, arcList, depot, passDepot): #start和end均为int类型
+    #首先需要获取从start到end需要经过哪些边
+    travelCost = 0.0
+    if start == end:
+        return travelCost, dis, pathList, passDepot
+    else:
+        count = start * verticeNum + end
+        route = pathList[count].getRoute()
+        index = -1
+        for t in range(len(route)-1):
+            head = route[t]
+            tail = route[t+1]
+            for i in range(len(arcList)):
+                if arcList[i].getHead() == head and arcList[i].getTail() == tail:
+                    index = i
+                    break
+            if arcList[index].getStoDeadCost() > 0:
+                travelCost = travelCost + arcList[index].getStoDeadCost()
+                if tail == depot:
+                    passDepot = 1
+            else:
+                arcList[index].setConnect(0)
+                if index % 2 == 0:
+                    arcList[index + 1].setConnect(0)
+                else:
+                    arcList[index - 1].setConnect(0)
+                dis, pathList = floyd(verticeNum, arcList)
+                thisTravelCost, dis, pathList, passDepot = travel(head, end, dis, pathList, verticeNum, arcList, depot, passDepot)
+                travelCost = travelCost + thisTravelCost
+                break
+        return travelCost, dis, pathList, passDepot
+
+
+def calMaxCost(unEdgeList, load, vehiclePosition, depot, dis):
+    maxCost = 0.0
+    for i in range(len(unEdgeList)):
+        thisEdgeCost = 0
+        head = unEdgeList[i].getHead()
+        if load >= unEdgeList[i].getDemand():
+            thisEdgeCost = unEdgeList[i].getSerCost() + dis[vehiclePosition][head]
+        else:
+            thisEdgeCost = unEdgeList[i].getSerCost() + dis[vehiclePosition][depot] + dis[depot][head]
+        if(thisEdgeCost > maxCost):
+            maxCost = thisEdgeCost
+    return maxCost
+
+def calMaxDepotCost(unEdgeList, dis, depot):
+    maxDepotCost = 0.0
+    for i in range(len(unEdgeList)):
+        thisDepotCost = 0.0
+        tail = unEdgeList[i].getTail()
+        thisDepotCost = dis[tail][depot]
+        if thisDepotCost > maxDepotCost:
+            maxDepotCost = thisDepotCost
+    return maxDepotCost
+
+
+def evalRules(individual, sampleNum):
+    # compile: Transform the tree expression in a callable function
+    # 这里将individual的树形表现形式转换为可执行的形式
+    func = toolbox.compile(expr=individual)
+    # 如果把读文件放在这里，那么每评价一个个体，都需要读一次文件
+    rf = readfile2.graph()
+    verticeNum, numReq, arcList, capacity, depot, vehiculous = rf.read()
+    unEdgeTotalNum = len(arcList) / 2.0
+    distance, firstPathList = floyd(verticeNum, arcList)
+    # begin the evaluation
+    # 5次取平均值
+    totalTourCost = 0.0
+    AllRoute=[]
+    for batch in range(sampleNum):
+        route=[]
+        tourCost = 0.0
+        # multiple vehicles
+        timeList = []
+        for v in range(vehiculous):
+            vehicle = Vehicle(0.0, v, capacity, depot, [])
+            timeList.append(vehicle)
+        dis = distance
+        pathList = copy.deepcopy(firstPathList)
+        totalSerCost=0.0
+        for i in range(0, len(arcList),2):
+            totalSerCost += arcList[i].getSerCost()
+        # 为第 #batch# 个不确定实例随机生成deadheading costs和demands
+        for i in range(0, len(arcList), 2):
+            mu = arcList[i].getDeadCost()  # 期望
+            sigma = 0.2 * mu  # 标准差
+            num = 1  # 个数为1
+            stoDeadCost = numpy.random.normal(mu, sigma, num)
+            arcList[i].setStoDeadCost(round(stoDeadCost[0], 2))
+            arcList[i+1].setStoDeadCost(round(stoDeadCost[0], 2))
+            stoDemand = 0.0
+            if stoDeadCost > 0:
+                mu = arcList[i].getDemand()   # 期望
+                sigma = 0.2 * mu  # 标准差
+                num = 1
+                stoD = numpy.random.normal(mu, sigma, num)
+                stoDemand = round(stoD[0], 2)
+            if stoDemand < 0:
+                stoDemand = 0.0
+            arcList[i].setStoDemand(stoDemand)
+            arcList[i+1].setStoDemand(stoDemand)
+            arcList[i].setConnect(1)
+            arcList[i+1].setConnect(1)
+            arcList[i].setRDF(1.0)#remaining demand fraction
+            arcList[i+1].setRDF(1.0)
+        unEdgeList = copy.deepcopy(arcList)
+        #实例在线确定后，开始演化路线
+        while len(unEdgeList) > 0:
+            #maxCost = calMaxCost(unEdgeList, timeList[0].vehicleLoad, timeList[0].vehilePosition, depot, dis)
+            #maxDepotCost = calMaxDepotCost(unEdgeList, dis, depot)
+            # 不明白这里下面为什么要减1再除以2
+            currentUnEdgeNum = len(unEdgeList) / 2.0
+            candidateTask = []
+            for i in range(len(unEdgeList)):
+                if unEdgeList[i].getDemand() <= timeList[0].vehicleLoad: # 有filter
+                    head = unEdgeList[i].getHead()
+                    tail = unEdgeList[i].getTail()
+                    currentCFH = dis[timeList[0].vehiclePosition][head]
+                    currentCR = dis[timeList[0].vehiclePosition][depot]
+                    currentCTD = dis[tail][depot]
+                    minCTT1 =sys.float_info.max #要排除反方向的
+                    CUTindex = -1 #the index of the closet unserved task
+                    if i % 2 == 0:
+                        reviseI = i + 1
+                    else:
+                        reviseI = i - 1
+                    for remaining in range(len(unEdgeList)):
+                        if remaining != i and remaining != reviseI:
+                            if dis[tail][unEdgeList[remaining].getHead()] < minCTT1:
+                                minCTT1 = dis[tail][unEdgeList[remaining].getHead()]
+                                CUTindex = remaining
+                    if CUTindex == -1:
+                        currentCTT1 = 0
+                        currentDEM1 = 0
+                    else:
+                        currentCTT1 = minCTT1
+                        currentDEM1 = unEdgeList[CUTindex].getDemand()
+                    currentDEM = unEdgeList[i].getDemand()
+                    currentFRT = (unEdgeTotalNum - currentUnEdgeNum) /unEdgeTotalNum
+                    currentFULL = (capacity - timeList[0].vehicleLoad) / capacity
+                    currentRQ = timeList[0].vehicleLoad
+                    currentSC = unEdgeList[i].getSerCost()
+                    #currentCFR1 = dis[timeList[1].vehiclePosition][head]
+                    #for ve in range(2, len(timeList)):
+                        #if dis[timeList[ve].vehiclePosition][head] < currentCFR1:
+                            #currentCFR1 = dis[timeList[ve].vehiclePosition][head]
+                    try:
+                        hv = func(currentCFH,currentCR,currentCTD,currentCTT1,currentDEM,currentDEM1,currentFRT,currentFULL,currentRQ,currentSC)
+                    except:
+                        print(individual)
+                        print(hv)
+                    if math.isinf(hv):
+                        hv = 1
+                    elif math.isnan(hv):
+                        hv = 0
+                    else:
+                        hv = hv
+                    unEdgeList[i].setHValue(hv)
+                    # 根据 "车-任务规则" 确定一组待服务的任务，如有n辆车，则选出hv值最小的n个任务，将任务编号存入candidateTask列表中
+                    candidateTask.insert(0, i)
+                    for x in range(len(candidateTask)-1, -1, -1):
+                        if unEdgeList[i].getHValue() >= unEdgeList[candidateTask[x]].getHValue():
+                            candidateTask.insert(x+1, i)
+                            del candidateTask[0]
+                            break
+                    if len(candidateTask) > vehiculous:
+                        del candidateTask[-1]
+            # 当前车辆不能满足剩余的任务
+            if len(candidateTask) == 0:
+                # 当前车辆要返回depot
+                passDepot = 0
+                thisTravelCost, dis, pathList, passDepot = travel(timeList[0].vehiclePosition, depot, dis, pathList,
+                                                                  verticeNum, arcList, depot, passDepot)
+                tourCost = tourCost + thisTravelCost
+                timeList[0].time = timeList[0].time + thisTravelCost
+                timeList[0].vehiclePosition = depot
+                timeList[0].vehicleLoad = capacity
+                for i in range(len(timeList) - 1, -1, -1):
+                    if timeList[i].time <= timeList[0].time:
+                        timeList.insert(i + 1, timeList[0])
+                        break
+                del timeList[0]
+            else:
+                # 如果候选任务集不为空，那么就根据 "任务-车规则" 确定一个唯一服务的任务
+                # candidateTask集合中的任务都是车1能够满足的
+                chosenTaskID = candidateTask[0]
+                # First of all, travel to the head of the chosen task, input the current position of the vehicle, and the head of the chosen task,
+                #    return the traveling cost of this process
+                # if pass the depot on the way, its capacity is refilled.
+                passDepot = 0
+                thisTravelCost, dis, pathList, passDepot = travel(timeList[0].vehiclePosition, unEdgeList[chosenTaskID].getHead(), dis, pathList, verticeNum, arcList, depot, passDepot)
+                if passDepot == 1:
+                    timeList[0].vehicleLoad = capacity
+                tourCost = tourCost + thisTravelCost
+                timeList[0].time = timeList[0].time + thisTravelCost
+                timeList[0].vehiclePosition = unEdgeList[chosenTaskID].getHead()
+                # 到达该任务的起点后，首先可以获知该任务是否可以通行。
+                if unEdgeList[chosenTaskID].getStoDeadCost() > 0: # 可以通行
+                    timeList[0].vehicleTour.append(unEdgeList[chosenTaskID].getID())
+                    if timeList[0].vehicleLoad >= unEdgeList[chosenTaskID].getRDF() * unEdgeList[chosenTaskID].getStoDemand():
+                        # 可以正常服务完选中的task
+                        thisServeCost = unEdgeList[chosenTaskID].getRDF() * unEdgeList[chosenTaskID].getSerCost() + (1.0 - unEdgeList[chosenTaskID].getRDF()) * unEdgeList[chosenTaskID].getStoDeadCost()
+                        tourCost = tourCost + thisServeCost
+                        timeList[0].vehicleLoad = timeList[0].vehicleLoad - unEdgeList[chosenTaskID].getRDF() * unEdgeList[chosenTaskID].getStoDemand()
+                        timeList[0].vehiclePosition = unEdgeList[chosenTaskID].getTail()
+                        if timeList[0].vehiclePosition == depot:
+                            timeList[0].vehicleLoad = capacity
+                        timeList[0].time = timeList[0].time + thisServeCost
+                        unEdgeList[chosenTaskID].setRDF(0.0)
+                        del unEdgeList[chosenTaskID]
+                        if chosenTaskID % 2 == 0:
+                            del unEdgeList[chosenTaskID]
+                        else:
+                            del unEdgeList[chosenTaskID - 1]
+                        # 删除timeList的首位元素，然后将该车辆新的执行时刻加入到timeList中
+                        for i in range(len(timeList) - 1, -1, -1):
+                            if timeList[i].time <= timeList[0].time:
+                                timeList.insert(i + 1, timeList[0])
+                                break
+                        del timeList[0]
+                    else:
+                        # route failure, back to the depot to refill, and then came back to complete the service
+                        thisServeCost = unEdgeList[chosenTaskID].getSerCost()
+                        tourCost = tourCost + thisServeCost
+                        timeList[0].time = timeList[0].time + thisServeCost
+                        timeList[0].vehiclePosition = unEdgeList[chosenTaskID].getTail()
+                        # back to the depot
+                        thisTravelCost, dis, pathList, passDepot = travel(timeList[0].vehiclePosition, depot, dis, pathList, verticeNum, arcList, depot, passDepot)
+                        tourCost = tourCost + thisTravelCost
+                        timeList[0].time = timeList[0].time + thisTravelCost
+                        timeList[0].vehiclePosition = depot
+                        timeList[0].vehicleLoad = capacity
+                        # go to the head of the task
+                        thisTravelCost, dis, pathList, passDepot = travel(timeList[0].vehiclePosition, unEdgeList[chosenTaskID].getHead(), dis, pathList, verticeNum, arcList, depot, passDepot)
+                        tourCost = tourCost + thisTravelCost
+                        timeList[0].time = timeList[0].time + thisTravelCost
+                        # finish the serve
+                        tourCost = tourCost + unEdgeList[chosenTaskID].getStoDeadCost()
+                        timeList[0].time = timeList[0].time + unEdgeList[chosenTaskID].getStoDeadCost()
+                        timeList[0].vehiclePosition = unEdgeList[chosenTaskID].getTail()
+                        del unEdgeList[chosenTaskID]
+                        if chosenTaskID % 2 == 0:
+                            del unEdgeList[chosenTaskID]
+                        else:
+                            del unEdgeList[chosenTaskID - 1]
+                        # 删除timeList的首位元素，然后将该车辆新的执行时刻加入到timeList中
+                        for i in range(len(timeList) - 1, -1, -1):
+                            if timeList[i].time <= timeList[0].time:
+                                timeList.insert(i + 1, timeList[0])
+                                break
+                        del timeList[0]
+                else:
+                    #不可以通行，那么删掉该任务，重新为车辆分配下一个任务
+                    #更新全局信息
+                    h = unEdgeList[chosenTaskID].getHead()
+                    t = unEdgeList[chosenTaskID].getTail()
+                    for i in range(len(arcList)):
+                        if arcList[i].getHead() == h and arcList[i].getTail() == t:
+                            ID = i
+                            break
+                    arcList[ID].setConnect(0)
+                    if ID % 2 == 0:
+                        arcList[ID + 1].setConnect(0)
+                    else:
+                        arcList[ID - 1].setConnect(0)
+                    dis, pathList = floyd(verticeNum, arcList)
+                    del unEdgeList[chosenTaskID]
+                    if chosenTaskID % 2 == 0:
+                        del unEdgeList[chosenTaskID]
+                    else:
+                        del unEdgeList[chosenTaskID - 1]
+                    # 删除timeList的首位元素，然后将该车辆新的执行时刻加入到timeList中
+                    for i in range(len(timeList) - 1, -1, -1):
+                        if timeList[i].time <= timeList[0].time:
+                            timeList.insert(i + 1, timeList[0])
+                            break
+                    del timeList[0]
+        #最后所有车辆还需返回depot
+        for v in range(vehiculous):
+            passDepot = 0
+            backC, dis, pathList, passDepot = travel(timeList[v].vehiclePosition, depot, dis, pathList, verticeNum, arcList, depot, passDepot)
+            tourCost = tourCost + backC
+            timeList[v].vehicleTour.append(0)
+            # 汇总此轮的路径
+            for w in range(len(timeList[v].vehicleTour)):
+                route.append(timeList[v].vehicleTour[w])
+        totalTourCost = totalTourCost + tourCost
+        AllRoute.append(route)
+
+    stability = 0.0
+    for a in range(sampleNum):
+        for b in range(a+1,sampleNum):
+            sameNum = 0
+            num = 0
+            for i in range(len(AllRoute[b])-1):
+                if AllRoute[b][i]!=0 and AllRoute[b][i+1]!=0:
+                    num += 1
+                    j=0
+                    while j < len(AllRoute[a]):
+                        if AllRoute[b][i]==AllRoute[a][j] and AllRoute[b][i+1]==AllRoute[a][j+1]:
+                            sameNum += 1
+                            break
+                        else:
+                            j += 1
+            stability += sameNum/num
+    cou=0
+    for c in range(1,sampleNum):
+        cou += c
+    stability=stability/cou
+
+    avgCost = totalTourCost / sampleNum
+    #avgCost = 3*avgCost / totalSerCost -stability
+    #注意这个逗号，即使是单变量优化问题，也需要返回tuple（元组类型）
+    return avgCost,
+
+
+def testRules(individual, sampleNum):
+    # compile: Transform the tree expression in a callable function
+    # 这里将individual的树形表现形式转换为可执行的形式
+    func = toolbox.compile(expr=individual)
+    # 如果把读文件放在这里，那么每评价一个个体，都需要读一次文件
+    rf = readfile2.graph()
+    verticeNum, numReq, arcList, capacity, depot, vehiculous = rf.read()
+    unEdgeTotalNum = len(arcList) / 2.0
+    distance, firstPathList = floyd(verticeNum, arcList)
+    # begin the evaluation
+    # 5次取平均值
+    totalTourCost = 0.0
+    AllRoute=[]
+    for batch in range(sampleNum):
+        route=[]
+        tourCost = 0.0
+        # multiple vehicles
+        timeList = []
+        for v in range(vehiculous):
+            vehicle = Vehicle(0.0, v, capacity, depot, [])
+            timeList.append(vehicle)
+        dis = distance
+        pathList = copy.deepcopy(firstPathList)
+        totalSerCost=0.0
+        for i in range(0, len(arcList),2):
+            totalSerCost += arcList[i].getSerCost()
+        # 为第 #batch# 个不确定实例随机生成deadheading costs和demands
+        for i in range(0, len(arcList), 2):
+            mu = arcList[i].getDeadCost()  # 期望
+            sigma = 0.2 * mu  # 标准差
+            num = 1  # 个数为1
+            numpy.random.seed(batch+i)
+            stoDeadCost = numpy.random.normal(mu, sigma, num)
+            arcList[i].setStoDeadCost(round(stoDeadCost[0], 2))
+            arcList[i+1].setStoDeadCost(round(stoDeadCost[0], 2))
+            stoDemand = 0.0
+            if stoDeadCost > 0:
+                mu = arcList[i].getDemand()   # 期望
+                sigma = 0.2 * mu  # 标准差
+                num = 1
+                #numpy.random.seed(batch*99)
+                stoD = numpy.random.normal(mu, sigma, num)
+                stoDemand = round(stoD[0], 2)
+            if stoDemand < 0:
+                stoDemand = 0.0
+            arcList[i].setStoDemand(stoDemand)
+            arcList[i+1].setStoDemand(stoDemand)
+            arcList[i].setConnect(1)
+            arcList[i+1].setConnect(1)
+            arcList[i].setRDF(1.0)#remaining demand fraction
+            arcList[i+1].setRDF(1.0)
+        unEdgeList = copy.deepcopy(arcList)
+        #实例在线确定后，开始演化路线
+        while len(unEdgeList) > 0:
+            #maxCost = calMaxCost(unEdgeList, timeList[0].vehicleLoad, timeList[0].vehilePosition, depot, dis)
+            #maxDepotCost = calMaxDepotCost(unEdgeList, dis, depot)
+            # 不明白这里下面为什么要减1再除以2
+            currentUnEdgeNum = len(unEdgeList) / 2.0
+            candidateTask = []
+            for i in range(len(unEdgeList)):
+                if unEdgeList[i].getDemand() <= timeList[0].vehicleLoad: # 有filter
+                    head = unEdgeList[i].getHead()
+                    tail = unEdgeList[i].getTail()
+                    currentCFH = dis[timeList[0].vehiclePosition][head]
+                    currentCR = dis[timeList[0].vehiclePosition][depot]
+                    currentCTD = dis[tail][depot]
+                    minCTT1 =sys.float_info.max #要排除反方向的
+                    CUTindex = -1 #the index of the closet unserved task
+                    if i % 2 == 0:
+                        reviseI = i + 1
+                    else:
+                        reviseI = i - 1
+                    for remaining in range(len(unEdgeList)):
+                        if remaining != i and remaining != reviseI:
+                            if dis[tail][unEdgeList[remaining].getHead()] < minCTT1:
+                                minCTT1 = dis[tail][unEdgeList[remaining].getHead()]
+                                CUTindex = remaining
+                    if CUTindex == -1:
+                        currentCTT1 = 0
+                        currentDEM1 = 0
+                    else:
+                        currentCTT1 = minCTT1
+                        currentDEM1 = unEdgeList[CUTindex].getDemand()
+                    currentDEM = unEdgeList[i].getDemand()
+                    currentFRT = (unEdgeTotalNum - currentUnEdgeNum) /unEdgeTotalNum
+                    currentFULL = (capacity - timeList[0].vehicleLoad) / capacity
+                    currentRQ = timeList[0].vehicleLoad
+                    currentSC = unEdgeList[i].getSerCost()
+                    #currentCFR1 = dis[timeList[1].vehiclePosition][head]
+                    #for ve in range(2, len(timeList)):
+                        #if dis[timeList[ve].vehiclePosition][head] < currentCFR1:
+                            #currentCFR1 = dis[timeList[ve].vehiclePosition][head]
+                    try:
+                        hv = func(currentCFH,currentCR,currentCTD,currentCTT1,currentDEM,currentDEM1,currentFRT,currentFULL,currentRQ,currentSC)
+                    except:
+                        print(individual)
+                        print(hv)
+                    if math.isinf(hv):
+                        hv = 1
+                    elif math.isnan(hv):
+                        hv = 0
+                    else:
+                        hv = hv
+                    unEdgeList[i].setHValue(hv)
+                    # 根据 "车-任务规则" 确定一组待服务的任务，如有n辆车，则选出hv值最小的n个任务，将任务编号存入candidateTask列表中
+                    candidateTask.insert(0, i)
+                    for x in range(len(candidateTask)-1, -1, -1):
+                        if unEdgeList[i].getHValue() >= unEdgeList[candidateTask[x]].getHValue():
+                            candidateTask.insert(x+1, i)
+                            del candidateTask[0]
+                            break
+                    if len(candidateTask) > vehiculous:
+                        del candidateTask[-1]
+            # 当前车辆不能满足剩余的任务
+            if len(candidateTask) == 0:
+                # 当前车辆要返回depot
+                passDepot = 0
+                thisTravelCost, dis, pathList, passDepot = travel(timeList[0].vehiclePosition, depot, dis, pathList,
+                                                                  verticeNum, arcList, depot, passDepot)
+                tourCost = tourCost + thisTravelCost
+                timeList[0].time = timeList[0].time + thisTravelCost
+                timeList[0].vehiclePosition = depot
+                timeList[0].vehicleLoad = capacity
+                for i in range(len(timeList) - 1, -1, -1):
+                    if timeList[i].time <= timeList[0].time:
+                        timeList.insert(i + 1, timeList[0])
+                        break
+                del timeList[0]
+            else:
+                # 如果候选任务集不为空，那么就根据 "任务-车规则" 确定一个唯一服务的任务
+                # candidateTask集合中的任务都是车1能够满足的
+                chosenTaskID = candidateTask[0]
+                # First of all, travel to the head of the chosen task, input the current position of the vehicle, and the head of the chosen task,
+                #    return the traveling cost of this process
+                # if pass the depot on the way, its capacity is refilled.
+                passDepot = 0
+                thisTravelCost, dis, pathList, passDepot = travel(timeList[0].vehiclePosition, unEdgeList[chosenTaskID].getHead(), dis, pathList, verticeNum, arcList, depot, passDepot)
+                if passDepot == 1:
+                    timeList[0].vehicleLoad = capacity
+                tourCost = tourCost + thisTravelCost
+                timeList[0].time = timeList[0].time + thisTravelCost
+                timeList[0].vehiclePosition = unEdgeList[chosenTaskID].getHead()
+                # 到达该任务的起点后，首先可以获知该任务是否可以通行。
+                if unEdgeList[chosenTaskID].getStoDeadCost() > 0: # 可以通行
+                    timeList[0].vehicleTour.append(unEdgeList[chosenTaskID].getID())
+                    if timeList[0].vehicleLoad >= unEdgeList[chosenTaskID].getRDF() * unEdgeList[chosenTaskID].getStoDemand():
+                        # 可以正常服务完选中的task
+                        thisServeCost = unEdgeList[chosenTaskID].getRDF() * unEdgeList[chosenTaskID].getSerCost() + (1.0 - unEdgeList[chosenTaskID].getRDF()) * unEdgeList[chosenTaskID].getStoDeadCost()
+                        tourCost = tourCost + thisServeCost
+                        timeList[0].vehicleLoad = timeList[0].vehicleLoad - unEdgeList[chosenTaskID].getRDF() * unEdgeList[chosenTaskID].getStoDemand()
+                        timeList[0].vehiclePosition = unEdgeList[chosenTaskID].getTail()
+                        if timeList[0].vehiclePosition == depot:
+                            timeList[0].vehicleLoad = capacity
+                        timeList[0].time = timeList[0].time + thisServeCost
+                        unEdgeList[chosenTaskID].setRDF(0.0)
+                        del unEdgeList[chosenTaskID]
+                        if chosenTaskID % 2 == 0:
+                            del unEdgeList[chosenTaskID]
+                        else:
+                            del unEdgeList[chosenTaskID - 1]
+                        # 删除timeList的首位元素，然后将该车辆新的执行时刻加入到timeList中
+                        for i in range(len(timeList) - 1, -1, -1):
+                            if timeList[i].time <= timeList[0].time:
+                                timeList.insert(i + 1, timeList[0])
+                                break
+                        del timeList[0]
+                    else:
+                        # route failure, back to the depot to refill, and then came back to complete the service
+                        thisServeCost = unEdgeList[chosenTaskID].getSerCost()
+                        tourCost = tourCost + thisServeCost
+                        timeList[0].time = timeList[0].time + thisServeCost
+                        timeList[0].vehiclePosition = unEdgeList[chosenTaskID].getTail()
+                        # back to the depot
+                        thisTravelCost, dis, pathList, passDepot = travel(timeList[0].vehiclePosition, depot, dis, pathList, verticeNum, arcList, depot, passDepot)
+                        tourCost = tourCost + thisTravelCost
+                        timeList[0].time = timeList[0].time + thisTravelCost
+                        timeList[0].vehiclePosition = depot
+                        timeList[0].vehicleLoad = capacity
+                        # go to the head of the task
+                        thisTravelCost, dis, pathList, passDepot = travel(timeList[0].vehiclePosition, unEdgeList[chosenTaskID].getHead(), dis, pathList, verticeNum, arcList, depot, passDepot)
+                        tourCost = tourCost + thisTravelCost
+                        timeList[0].time = timeList[0].time + thisTravelCost
+                        # finish the serve
+                        tourCost = tourCost + unEdgeList[chosenTaskID].getStoDeadCost()
+                        timeList[0].time = timeList[0].time + unEdgeList[chosenTaskID].getStoDeadCost()
+                        timeList[0].vehiclePosition = unEdgeList[chosenTaskID].getTail()
+                        del unEdgeList[chosenTaskID]
+                        if chosenTaskID % 2 == 0:
+                            del unEdgeList[chosenTaskID]
+                        else:
+                            del unEdgeList[chosenTaskID - 1]
+                        # 删除timeList的首位元素，然后将该车辆新的执行时刻加入到timeList中
+                        for i in range(len(timeList) - 1, -1, -1):
+                            if timeList[i].time <= timeList[0].time:
+                                timeList.insert(i + 1, timeList[0])
+                                break
+                        del timeList[0]
+                else:
+                    #不可以通行，那么删掉该任务，重新为车辆分配下一个任务
+                    #更新全局信息
+                    h = unEdgeList[chosenTaskID].getHead()
+                    t = unEdgeList[chosenTaskID].getTail()
+                    for i in range(len(arcList)):
+                        if arcList[i].getHead() == h and arcList[i].getTail() == t:
+                            ID = i
+                            break
+                    arcList[ID].setConnect(0)
+                    if ID % 2 == 0:
+                        arcList[ID + 1].setConnect(0)
+                    else:
+                        arcList[ID - 1].setConnect(0)
+                    dis, pathList = floyd(verticeNum, arcList)
+                    del unEdgeList[chosenTaskID]
+                    if chosenTaskID % 2 == 0:
+                        del unEdgeList[chosenTaskID]
+                    else:
+                        del unEdgeList[chosenTaskID - 1]
+                    # 删除timeList的首位元素，然后将该车辆新的执行时刻加入到timeList中
+                    for i in range(len(timeList) - 1, -1, -1):
+                        if timeList[i].time <= timeList[0].time:
+                            timeList.insert(i + 1, timeList[0])
+                            break
+                    del timeList[0]
+        #最后所有车辆还需返回depot
+        for v in range(vehiculous):
+            passDepot = 0
+            backC, dis, pathList, passDepot = travel(timeList[v].vehiclePosition, depot, dis, pathList, verticeNum, arcList, depot, passDepot)
+            tourCost = tourCost + backC
+            timeList[v].vehicleTour.append(0)
+            # 汇总此轮的路径
+            for w in range(len(timeList[v].vehicleTour)):
+                route.append(timeList[v].vehicleTour[w])
+        totalTourCost = totalTourCost + tourCost
+        AllRoute.append(route)
+    DiffRoute=[]
+    DiffRoute.append(AllRoute[0])
+    for d1 in range(1, (len(AllRoute))):#从第1个到最后1个，都跟diffRoute中的路径对比一下，相同的跳过，不相同的加进去
+        sameRoute=False
+        d2=0
+        while (d2<len(DiffRoute) and sameRoute==False):
+            sameNum = 0
+            i=0
+            while(i<len(AllRoute[d1])-1):
+                j=0
+                while (j<len(DiffRoute[d2])-1):
+                    if AllRoute[d1][i]==DiffRoute[d2][j] and AllRoute[d1][i+1]==DiffRoute[d2][j+1]:
+                        sameNum += 1
+                        break
+                    else:
+                        j += 1
+                i += 1
+            if sameNum == len(AllRoute[d1])-1:
+                sameRoute=True
+            d2 += 1
+        if sameRoute == False:
+            DiffRoute.append(AllRoute[d1])
+    print("the length of diffRoute is:", len(DiffRoute))
+
+    stability = 0.0
+    for a in range(sampleNum):
+        for b in range(a+1,sampleNum):
+            sameNum = 0
+            num = 0
+            for i in range(len(AllRoute[b])-1):
+                if AllRoute[b][i]!=0 and AllRoute[b][i+1]!=0:
+                    num += 1
+                    j=0
+                    while j < len(AllRoute[a]):
+                        if AllRoute[b][i]==AllRoute[a][j] and AllRoute[b][i+1]==AllRoute[a][j+1]:
+                            sameNum += 1
+                            break
+                        else:
+                            j += 1
+            stability += sameNum/num
+    cou=0
+    for c in range(1,sampleNum):
+        cou += c
+    stability=stability/cou
+    avgCost = totalTourCost / sampleNum
+    '''
+    if (sampleNum==500):
+        print(avgCost)
+    avgCost = 2*avgCost / totalSerCost -stability
+    if (sampleNum==500):
+        print(stability)   #需要记录的是这个值
+        print(totalSerCost)
+    '''
+    #注意这个逗号，即使是单变量优化问题，也需要返回tuple（元组类型）
+    return avgCost, stability
+
+
+
+toolbox.register("evaluate", evalRules, sampleNum=5)
+toolbox.register("select", tools.selTournament, tournsize=7)
+# 将gp.cxOnePoint函数命名为"mate"，放入工具箱中，执行时，调用工具箱的"mate"，便会直接调用gp.cxOnePoint，进行交叉
+toolbox.register("mate", gp.cxOnePoint)
+toolbox.register("expr_mut", gp.genFull, min_=2, max_=4)
+toolbox.register("mutate", gp.mutUniform, expr=toolbox.expr_mut, pset=pset)
+
+toolbox.decorate("mate", gp.staticLimit(key=operator.attrgetter("height"), max_value=8))
+toolbox.decorate("mutate", gp.staticLimit(key=operator.attrgetter("height"), max_value=8))
+
+def gpSimple(population, toolbox, cxpb, mutpb, ngen, stats=None,
+             halloffame=None, verbose=__debug__):
+    #st = datetime.datetime.now()
+    starttime = datetime.datetime.now()
+
+    logbook = tools.Logbook()
+    logbook.header = ['gen', 'nevals'] + (stats.fields if stats else [])
+
+    # Evaluate the individuals with an invalid fitness
+    invalid_ind = [ind for ind in population if not ind.fitness.valid]
+    fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+    for ind, fit in zip(invalid_ind, fitnesses):
+        ind.fitness.values = fit
+
+    if halloffame is not None:
+        halloffame.update(population)
+
+    record = stats.compile(population) if stats else {}
+    logbook.record(gen=0, nevals=len(invalid_ind), **record)
+
+    #创建文件，将结果写入文件中
+    #fileName = "/Users/liuyx/PycharmProjects/ga/output%s.xlsx" % starttime
+    fileName = "gdb23%s.xlsx"%starttime.strftime('%Y%m%d%H%M%S')
+    sheetName = "Traditional"
+    excelUtil = ExcelUtil(fileName, sheetName)
+    excelWb = excelUtil.createExcelSheet()
+
+    aStr = ''
+    if verbose:
+        #aStr = logbook.stream
+        #print aStr
+        print(logbook.stream)
+
+    # 打印最优个体
+    print(halloffame.items[0])
+    print(halloffame.keys[0]) #这是中间某一代最好的，不一定是最后一代中最好的。
+    #第0代中最优个体在testing中的表现
+    #avgTest = evalRules(halloffame.items[0], 500)
+    #print "avgTest:", avgTest[0]
+    endtime = datetime.datetime.now()
+    time = endtime - starttime
+    print(time)
+
+    bStr = '%s'%halloffame.items[0]
+    cStr = '%s'%halloffame.keys[0]
+
+
+    excelUtil.wirteDBToExcelByWb(aStr, bStr, cStr, time)
+
+
+    # Begin the generational process
+    for gen in range(1, ngen + 1):
+        # Select the next generation individuals
+        offspring = toolbox.select(population, len(population))
+
+        # Vary the pool of individuals
+        offspring = algorithms.varAnd(offspring, toolbox, cxpb, mutpb)
+
+        # Evaluate the individuals with an invalid fitness
+        #invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
+        invalid_ind = [ind for ind in offspring]#changed by Yuxin because each individual should be evaluated again
+        fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
+        for ind, fit in zip(invalid_ind, fitnesses):
+            ind.fitness.values = fit
+
+        # Update the hall of fame with the generated individuals
+        halloffame = tools.HallOfFame(1)
+        if halloffame is not None:
+            halloffame.update(offspring) #similar的情况，不影响结果，因为还是那个individual
+
+        # Replace the current population by the offspring
+        population[:] = offspring
+
+        # Append the current generation statistics to the logbook
+        record = stats.compile(population) if stats else {}
+        logbook.record(gen=gen, nevals=len(invalid_ind), **record)
+        if verbose:
+            print(logbook.stream)
+        # 打印最优个体
+        print(halloffame.items[0])
+        print(halloffame.keys[0])
+
+        endtime = datetime.datetime.now()
+        time = endtime - starttime
+        print(time)
+
+        aStr = '%s' % logbook.stream
+        bStr = '%s' % halloffame.items[0]
+        cStr = '%s' % halloffame.keys[0]
+
+        excelUtil.wirteDBToExcelByWb(aStr, bStr, cStr, time)
+
+        # test
+        if gen == ngen:
+            avgTest,stability = testRules(halloffame.items[0], 500)
+            print("avgTest:", avgTest)
+            print("stability:", stability)
+            excelUtil.wirteDBToExcelByWb('%s'%avgTest, '', '', '')
+            excelUtil.wirteDBToExcelByWb('%s' % stability, '', '', '')
+
+    excelUtil.saveWbObjToExcel(excelWb)
+    return population, logbook
+
+def main():
+    CFH = Terminal("CFH", str, object)
+    CTD = Terminal("CTD", str, object)
+    DEM1 = Terminal("DEM1", str, object)
+    FULL = Terminal("FULL", str, object)
+    CR = Terminal("CR", str, object)
+    DEM = Terminal("DEM", str, object)
+    SC = Terminal("SC", str, object)
+    FRT = Terminal("FRT", str, object)
+    CTT1 = Terminal("CTT1", str, object)
+    RQ = Terminal("RQ", str, object)
+    terminal031 = Terminal(0.31, 0, 0)
+    terminal026 = Terminal(0.26, 0, 0)
+    terminal035 = Terminal(0.35, 0, 0)
+    terminal006 = Terminal(0.06, 0, 0)
+    terminal014 = Terminal(0.14, 0, 0)
+    terminal067 = Terminal(0.67, 0, 0)
+    terminal021 = Terminal(0.21, 0, 0)
+    terminal059 = Terminal(0.59, 0, 0)
+    terminal095 = Terminal(0.95, 0, 0)
+    terminal016 = Terminal(0.16, 0, 0)
+    terminal079 = Terminal(0.79, 0, 0)
+    terminal051 = Terminal(0.51, 0, 0)
+    terminal047 = Terminal(0.47, 0, 0)
+    max = Primitive("max", [object, object], object)
+    min = Primitive("min", [object, object], object)
+    mul = Primitive("mul", [object, object], object)
+    sub = Primitive("sub", [object, object], object)
+    add = Primitive("add", [object, object], object)
+    protectedDiv = Primitive("protectedDiv", [object, object], object)
+
+    # list=[protectedDiv,CFH, CR]
+    # pt = gp.PrimitiveTree(list)
+
+    #listTra = [sub,mul,CFH, mul,CFH, add,DEM1, SC, protectedDiv,max,max,mul,protectedDiv,protectedDiv,DEM1, sub,SC, CTT1, sub,max,CFH, FRT, add,terminal020, RQ, SC, sub,sub,SC, RQ, CR, protectedDiv,FRT, sub,SC, CTT1, add,sub,CR, RQ, add,sub,DEM1, CR, sub,FULL, mul,CFH, add,DEM1, SC]
+    listTra=[add,CFH, protectedDiv,add,RQ, add,add,min,max,FRT, SC, mul,FULL, SC, mul,mul,terminal079, CR, min,RQ, CTT1, add,min,CFH, max,terminal016, CFH, min,max,CTT1, CFH, add,CTD, SC, CTD]
+    #listSta2=[sub, CFH, protectedDiv, protectedDiv, max, add, CTT1, CTD, max, min, CTT1, terminal004, mul, terminal068, SC, mul, terminal068, SC, sub, mul, protectedDiv, CR, terminal051, add, CTD, terminal019, sub, min, add, CTT1, CTD, mul, terminal068, SC, add, mul, CTD, terminal070, protectedDiv, CTT1, protectedDiv, SC, FULL]
+    listSta1=[add,CFH, add,protectedDiv,mul,protectedDiv,CR, CFH, sub,terminal047, FRT, min,max,RQ, mul,add,CTD, mul,DEM1, CFH, add,max,CR, terminal014, CTT1, mul,sub,FRT, CTD, FRT, min,min,add,CFH, CTT1, mul,add,max,FRT, terminal051, add,max,DEM, DEM1, sub,CTT1, DEM1, CR, CR]
+    #listSta1=[add,CFH, protectedDiv,max,terminal062, CTT1, max,protectedDiv,protectedDiv,terminal062, protectedDiv,protectedDiv,SC, RQ, RQ, sub,mul,CTD, terminal011, add,SC, terminal062, min,protectedDiv,max,CTD, protectedDiv,max,CTD, FULL, mul,FRT, SC, mul,FRT, SC, min,mul,CTD, terminal034, protectedDiv,mul,mul,CTD, FRT, RQ, FULL]
+    #listTra23=[protectedDiv,add,CFH, terminal047, max,max,CR, max,min,mul,sub,mul,CTT1, CTD, add,terminal059, CR, mul,add,CFH, FULL, CR, terminal095, max,SC, protectedDiv,mul,FULL, DEM1, add,protectedDiv,FULL, FULL, CR, SC]
+    # 479, 250.86, 0.7131
+    listTra23=[add,protectedDiv,protectedDiv,protectedDiv,min,max,CFH, CTD, DEM, mul,add,CR, max,add,CFH, terminal021, max,CTD, CTD, SC, max,FULL, sub,sub,sub,FULL, CTD, protectedDiv,CTD, add,CFH, terminal021, mul,max,max,RQ, terminal031, max,CR, CTD, CTD, mul,CTD, RQ, CFH]
+    #479,252.12,0.8036
+    listSta23=[mul,add,CFH, FRT, max,protectedDiv,add,sub,sub,DEM, CTT1, sub,DEM1, CFH, protectedDiv,sub,DEM, mul,FRT, mul,DEM, CTT1, mul,mul,CTD, DEM1, terminal006, max,min,sub,sub,DEM, sub,DEM, CTT1, max,FRT, FULL, protectedDiv,add,CFH, FRT, protectedDiv,DEM, DEM, RQ, mul,add,DEM, add,terminal035, mul,add,CFH, max,CFH, CFH, CFH, mul,mul,CFH, DEM, DEM]
+    #266, 252.24, 84.08
+    pt = gp.PrimitiveTree(listSta23)
+    avgTest,stability = testRules(pt, 500)
+    print("avgTest:", avgTest)
+    print("stability: ", stability)
+
+if __name__ == "__main__":
+    for run in range(1):
+        main()
